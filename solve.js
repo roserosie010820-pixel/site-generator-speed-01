@@ -18,10 +18,14 @@ const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
 const byCode = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const ESC_RE = /[&<>"']/;
 
-/** Escape & < > " ' in a whole string. */
+/**
+ * Escape & < > " ' in a whole string. Most strings hold none of the five,
+ * so a single test first avoids the replace (and its callback) on those.
+ */
 function esc(s) {
-  return s.replace(/[&<>"']/g, (c) => ESCAPES[c]);
+  return ESC_RE.test(s) ? s.replace(/[&<>"']/g, (c) => ESCAPES[c]) : s;
 }
 
 /** The most characters a slug keeps before a collision suffix. */
@@ -73,10 +77,26 @@ function longDate(date) {
   return Number(date.slice(8, 10)) + ' ' + MONTHS[Number(date.slice(5, 7)) - 1] + ' ' + date.slice(0, 4);
 }
 
-/** The words of a body: its runs of characters other than whitespace. */
+/**
+ * The words of a body: its runs of characters other than whitespace.
+ * Counted by a scan (no match array to allocate): a word starts where a
+ * non-whitespace character follows whitespace or the start. The table
+ * marks exactly JavaScript's \s code units, so this agrees with /\S+/g.
+ */
+const WS = new Uint8Array(65536);
+for (const c of [9, 10, 11, 12, 13, 32, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]) WS[c] = 1;
+for (let c = 0x2000; c <= 0x200a; c++) WS[c] = 1;
 function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m === null ? 0 : m.length;
+  let n = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    if (WS[text.charCodeAt(i)] === 1) inWord = false;
+    else if (!inWord) {
+      inWord = true;
+      n++;
+    }
+  }
+  return n;
 }
 
 /** `rel` (a link's path, "/"-separated) from the directory `dir`, or null when it climbs out of the root. */
@@ -324,7 +344,9 @@ function inlineInto(s, env, out) {
     const c = s[i];
     if (c === '\\' && i + 1 < s.length && ESCAPABLE.has(s[i + 1])) {
       flush(i);
-      out.push(s[i + 1]);
+      // The reference escapes the unescaped character: of the escapable set
+      // only '>' needs HTML escaping, so it alone becomes '&gt;'.
+      out.push(s[i + 1] === '>' ? '&gt;' : s[i + 1]);
       i += 2;
       run = i;
       continue;
@@ -668,12 +690,17 @@ function renderNodes(nodes, scope, templates, depth, out) {
     if (n.kind === 'for') {
       const xs = lookup(scope, n.path);
       if (!Array.isArray(xs)) continue;
+      // One vars/loop pair per render of this for-node, mutated per
+      // iteration: the scope is only read while this body renders, and a
+      // re-entrant render (via an include) builds its own pair.
+      const vars = { [n.name]: undefined, loop: { index: 0, first: false, last: false, length: xs.length } };
+      const childScope = { vars, parent: scope };
       for (let k = 0; k < xs.length; k++) {
-        const vars = {
-          [n.name]: xs[k],
-          loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length },
-        };
-        renderNodes(n.body, { vars, parent: scope }, templates, depth, out);
+        vars[n.name] = xs[k];
+        vars.loop.index = k + 1;
+        vars.loop.first = k === 0;
+        vars.loop.last = k === xs.length - 1;
+        renderNodes(n.body, childScope, templates, depth, out);
       }
       continue;
     }
